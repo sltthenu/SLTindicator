@@ -1,0 +1,657 @@
+//@version=5
+indicator("Liquidity Signal Engine Pro [1H]", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  LIQUIDITY SIGNAL ENGINE PRO — TradingView Pine Script v5
+//  Min 2 signals per day | 6 strategies | Manipulation filter
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+grp1 = "Signal Settings"
+min_prob        = input.int(52,    "Min Win Probability (%)",     minval=40, maxval=90, group=grp1)
+show_tp3        = input.bool(true, "Show TP3",                                          group=grp1)
+signal_cooldown = input.int(2,     "Signal Cooldown (bars)",       minval=1,  maxval=10, group=grp1)
+// Minimum signal enforcer: if N bars pass with no signal, fire best available
+min_sig_bars    = input.int(12,    "Force Signal Every N Bars (0=off)", minval=0, maxval=48, group=grp1)
+
+grp2 = "Liquidity Zones"
+liq_lookback   = input.int(20,    "Liquidity Lookback (bars)",    minval=5,  maxval=100, group=grp2)
+show_liq_zones = input.bool(true, "Show Liquidity Zones",                                group=grp2)
+show_heatmap   = input.bool(true, "Show Heatmap Boxes",                                  group=grp2)
+liq_zone_width = input.int(2,     "Zone Line Width",              minval=1,  maxval=4,   group=grp2)
+
+grp3 = "Manipulation Filter"
+wick_ratio     = input.float(2.0,  "Stop Hunt Wick Ratio",        minval=1.2, maxval=5.0, step=0.1,  group=grp3)
+sweep_filter   = input.bool(true,  "Enable Sweep Filter",                                             group=grp3)
+vol_surge_mult = input.float(1.2,  "Volume Surge Multiplier",     minval=1.0, maxval=3.0, step=0.1,  group=grp3)
+fake_break_vol = input.float(0.70, "Fake Breakout Vol Threshold", minval=0.3, maxval=0.9, step=0.05, group=grp3)
+
+grp4 = "Order Block Settings"
+ob_body_pct    = input.float(0.55, "OB Body/Range Ratio",         minval=0.3, maxval=0.9, step=0.05, group=grp4)
+show_ob        = input.bool(true,  "Show Order Blocks",                                              group=grp4)
+
+grp5 = "Display Colors"
+bull_col    = input.color(color.new(#00ff88, 0),  "Bull Color",    group=grp5)
+bear_col    = input.color(color.new(#ff3d5e, 0),  "Bear Color",    group=grp5)
+ob_bull_col = input.color(color.new(#00d4ff, 85), "Bull OB Color", group=grp5)
+ob_bear_col = input.color(color.new(#ff9900, 85), "Bear OB Color", group=grp5)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 1 - CORE CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+atr14     = ta.atr(14)
+atr5      = ta.atr(5)
+vol_avg   = ta.sma(volume, 20)
+vol_surge = volume / vol_avg
+
+ema9   = ta.ema(close, 9)
+ema21  = ta.ema(close, 21)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+rsi14    = ta.rsi(close, 14)
+rsi7     = ta.rsi(close, 7)
+vwap_val = ta.vwap(hlc3)
+
+// Stochastic for extra confluence
+stoch_k  = ta.sma(ta.stoch(close, high, low, 14), 3)
+stoch_d  = ta.sma(stoch_k, 3)
+
+bull_trend = ema9 > ema21 and ema21 > ema50
+bear_trend = ema9 < ema21 and ema21 < ema50
+
+body         = math.abs(close - open)
+candle_range = high - low
+upper_wick   = high - math.max(open, close)
+lower_wick   = math.min(open, close) - low
+body_ratio   = candle_range > 0 ? body / candle_range : 0.0
+
+// EMA cross signals (fast signal generator)
+ema_cross_up   = ta.crossover(ema9, ema21)
+ema_cross_down = ta.crossunder(ema9, ema21)
+
+// MACD for momentum
+[macd_line, signal_line, macd_hist] = ta.macd(close, 12, 26, 9)
+macd_bull = macd_line > signal_line and macd_hist > 0
+macd_bear = macd_line < signal_line and macd_hist < 0
+
+// VWAP deviation
+vwap_dev      = (close - vwap_val) / vwap_val * 100
+vwap_below    = vwap_dev < -0.3
+vwap_above    = vwap_dev >  0.3
+
+// Bollinger Bands for mean-reversion signals
+bb_basis = ta.sma(close, 20)
+bb_dev   = ta.stdev(close, 20)
+bb_upper = bb_basis + bb_dev * 2.0
+bb_lower = bb_basis - bb_dev * 2.0
+bb_pct   = (close - bb_lower) / (bb_upper - bb_lower)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 2 - SWING HIGH / LOW LIQUIDITY ZONES
+// ══════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, 4, 4)
+pl = ta.pivotlow(low,   4, 4)
+
+var float[] buy_liq_prices  = array.new_float(0)
+var float[] sell_liq_prices = array.new_float(0)
+var line[]  buy_liq_lines   = array.new_line(0)
+var line[]  sell_liq_lines  = array.new_line(0)
+
+if not na(ph) and show_liq_zones
+    array.push(sell_liq_prices, ph)
+    ln_s = line.new(bar_index - 4, ph, bar_index + 40, ph, color=color.new(bear_col, 40), width=liq_zone_width, style=line.style_dashed)
+    array.push(sell_liq_lines, ln_s)
+    if array.size(sell_liq_lines) > 10
+        line.delete(array.shift(sell_liq_lines))
+        array.shift(sell_liq_prices)
+
+if not na(pl) and show_liq_zones
+    array.push(buy_liq_prices, pl)
+    ln_b = line.new(bar_index - 4, pl, bar_index + 40, pl, color=color.new(bull_col, 40), width=liq_zone_width, style=line.style_dashed)
+    array.push(buy_liq_lines, ln_b)
+    if array.size(buy_liq_lines) > 10
+        line.delete(array.shift(buy_liq_lines))
+        array.shift(buy_liq_prices)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 3 - NEAREST LIQUIDITY DISTANCES
+// ══════════════════════════════════════════════════════════════════════════════
+var float nearest_buy_price  = na
+var float nearest_sell_price = na
+
+float nearest_buy_dist  = 999999.0
+float nearest_sell_dist = 999999.0
+float tmp_buy           = na
+float tmp_sell          = na
+
+if array.size(buy_liq_prices) > 0
+    for i = 0 to array.size(buy_liq_prices) - 1
+        p_b = array.get(buy_liq_prices, i)
+        d_b = math.abs(p_b - close)
+        if d_b < nearest_buy_dist
+            nearest_buy_dist := d_b
+            tmp_buy          := p_b
+    nearest_buy_price := tmp_buy
+
+if array.size(sell_liq_prices) > 0
+    for i = 0 to array.size(sell_liq_prices) - 1
+        p_s = array.get(sell_liq_prices, i)
+        d_s = math.abs(p_s - close)
+        if d_s < nearest_sell_dist
+            nearest_sell_dist := d_s
+            tmp_sell          := p_s
+    nearest_sell_price := tmp_sell
+
+buy_liq_intensity  = nearest_buy_dist  < atr14 * 5 ? math.round((1.0 - nearest_buy_dist  / (atr14 * 5)) * 100) : 0
+sell_liq_intensity = nearest_sell_dist < atr14 * 5 ? math.round((1.0 - nearest_sell_dist / (atr14 * 5)) * 100) : 0
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 4 - HEATMAP BOXES
+// ══════════════════════════════════════════════════════════════════════════════
+var box buy_heatmap_box  = na
+var box sell_heatmap_box = na
+
+if show_heatmap and not na(nearest_buy_price) and not na(nearest_sell_price)
+    box.delete(buy_heatmap_box)
+    box.delete(sell_heatmap_box)
+    heat_alpha_buy  = int(math.max(20.0, 90.0 - buy_liq_intensity))
+    heat_alpha_sell = int(math.max(20.0, 90.0 - sell_liq_intensity))
+    buy_heatmap_box  := box.new(bar_index - 3, nearest_buy_price  + atr14 * 0.15, bar_index + 1, nearest_buy_price  - atr14 * 0.15, bgcolor=color.new(bull_col, heat_alpha_buy),  border_color=color.new(bull_col, 60), border_width=1)
+    sell_heatmap_box := box.new(bar_index - 3, nearest_sell_price + atr14 * 0.15, bar_index + 1, nearest_sell_price - atr14 * 0.15, bgcolor=color.new(bear_col, heat_alpha_sell), border_color=color.new(bear_col, 60), border_width=1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 5 - ORDER BLOCK DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+bull_ob_condition = close[1] < open[1] and close > open and body_ratio > ob_body_pct and vol_surge > 1.0
+bear_ob_condition = close[1] > open[1] and close < open and body_ratio > ob_body_pct and vol_surge > 1.0
+
+var box bull_ob_box = na
+var box bear_ob_box = na
+
+if bull_ob_condition and show_ob
+    box.delete(bull_ob_box)
+    bull_ob_box := box.new(bar_index - 1, math.max(open[1], close[1]), bar_index + 25, math.min(open[1], close[1]), bgcolor=ob_bull_col, border_color=color.new(#00d4ff, 50), border_width=1)
+
+if bear_ob_condition and show_ob
+    box.delete(bear_ob_box)
+    bear_ob_box := box.new(bar_index - 1, math.max(open[1], close[1]), bar_index + 25, math.min(open[1], close[1]), bgcolor=ob_bear_col, border_color=color.new(#ff9900, 50), border_width=1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 6 - MANIPULATION DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+stop_hunt_bull = lower_wick > body * wick_ratio and close > open and lower_wick > atr14 * 0.3
+stop_hunt_bear = upper_wick > body * wick_ratio and close < open and upper_wick > atr14 * 0.3
+
+sweep_low  = low  < ta.lowest(low[1],   liq_lookback) and close > ta.lowest(low[1],   liq_lookback)
+sweep_high = high > ta.highest(high[1], liq_lookback) and close < ta.highest(high[1], liq_lookback)
+
+prev_high_break = high > ta.highest(high[1], 10) and volume < vol_avg * fake_break_vol
+prev_low_break  = low  < ta.lowest(low[1],   10) and volume < vol_avg * fake_break_vol
+
+last_sh  = ta.highest(high, liq_lookback)
+last_sl  = ta.lowest(low,   liq_lookback)
+bos_bull = close > last_sh[1] and close > ema21 and vol_surge > 0.9
+bos_bear = close < last_sl[1] and close < ema21 and vol_surge > 0.9
+
+wyckoff_spring   = low  < ta.lowest(low[1],  15) and close > open and vol_surge > 1.3 and rsi14 < 40
+wyckoff_upthrust = high > ta.highest(high[1], 15) and close < open and vol_surge > 1.3 and rsi14 > 60
+
+rsi_bull_div = low  < low[3]  and rsi14 > ta.lowest(rsi14,  3)[1] and buy_liq_intensity  > 25
+rsi_bear_div = high > high[3] and rsi14 < ta.highest(rsi14, 3)[1] and sell_liq_intensity > 25
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 7 - LIQUIDITY PROBABILITY SCORES
+// ══════════════════════════════════════════════════════════════════════════════
+// Buy-side score broken into individual variables (no multi-line continuation)
+bs_a = rsi14 < 30 ? 22 : rsi14 < 42 ? 14 : rsi14 < 52 ? 7 : 0
+bs_b = bull_trend       ? 14 : 0
+bs_c = stop_hunt_bull   ? 16 : 0
+bs_d = sweep_low        ? 14 : 0
+bs_e = wyckoff_spring   ? 12 : 0
+bs_f = close > vwap_val ? 8  : 0
+bs_g = vol_surge > vol_surge_mult ? 8  : 0
+bs_h = buy_liq_intensity > 40     ? 5  : 0
+bs_i = macd_bull                  ? 6  : 0
+bs_j = stoch_k < 25               ? 7  : 0
+bs_k = bb_pct < 0.15              ? 5  : 0
+bs_l = ema_cross_up               ? 8  : 0
+buy_prob_raw   = bs_a + bs_b + bs_c + bs_d + bs_e + bs_f + bs_g + bs_h + bs_i + bs_j + bs_k + bs_l
+buy_prob_final = math.min(buy_prob_raw, 97)
+
+// Sell-side score
+ss_a = rsi14 > 70 ? 22 : rsi14 > 58 ? 14 : rsi14 > 48 ? 7 : 0
+ss_b = bear_trend        ? 14 : 0
+ss_c = stop_hunt_bear    ? 16 : 0
+ss_d = sweep_high        ? 14 : 0
+ss_e = wyckoff_upthrust  ? 12 : 0
+ss_f = close < vwap_val  ? 8  : 0
+ss_g = vol_surge > vol_surge_mult  ? 8  : 0
+ss_h = sell_liq_intensity > 40     ? 5  : 0
+ss_i = macd_bear                   ? 6  : 0
+ss_j = stoch_k > 75                ? 7  : 0
+ss_k = bb_pct > 0.85               ? 5  : 0
+ss_l = ema_cross_down              ? 8  : 0
+sell_prob_raw   = ss_a + ss_b + ss_c + ss_d + ss_e + ss_f + ss_g + ss_h + ss_i + ss_j + ss_k + ss_l
+sell_prob_final = math.min(sell_prob_raw, 97)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 8 - SIGNAL CONDITIONS  (6 strategies)
+// ══════════════════════════════════════════════════════════════════════════════
+var int last_signal_bar = 0
+cooldown_ok = bar_index - last_signal_bar >= signal_cooldown
+
+// ── Strategy A: Liquidity Sweep Reversal ─────────────────────────────────────
+stratA_long  = (stop_hunt_bull or sweep_low)  and buy_prob_final  >= min_prob and cooldown_ok
+stratA_short = (stop_hunt_bear or sweep_high) and sell_prob_final >= min_prob and cooldown_ok
+
+// ── Strategy B: Order Block Mitigation ───────────────────────────────────────
+stratB_long  = bull_ob_condition and (bull_trend or ema_cross_up)  and buy_prob_final  >= (min_prob - 5) and cooldown_ok
+stratB_short = bear_ob_condition and (bear_trend or ema_cross_down) and sell_prob_final >= (min_prob - 5) and cooldown_ok
+
+// ── Strategy C: Break of Structure ───────────────────────────────────────────
+stratC_long  = bos_bull and close > ema21 and buy_prob_final  >= (min_prob - 8) and cooldown_ok
+stratC_short = bos_bear and close < ema21 and sell_prob_final >= (min_prob - 8) and cooldown_ok
+
+// ── Strategy D: RSI Divergence + Liq ─────────────────────────────────────────
+stratD_long  = rsi_bull_div and buy_prob_final  >= (min_prob - 8) and cooldown_ok
+stratD_short = rsi_bear_div and sell_prob_final >= (min_prob - 8) and cooldown_ok
+
+// ── Strategy E: EMA Cross + MACD Confluence (high frequency) ─────────────────
+stratE_long  = ema_cross_up   and macd_bull and rsi14 < 65 and buy_prob_final  >= (min_prob - 10) and cooldown_ok
+stratE_short = ema_cross_down and macd_bear and rsi14 > 35 and sell_prob_final >= (min_prob - 10) and cooldown_ok
+
+// ── Strategy F: VWAP Deviation Mean-Reversion (frequent, reliable) ───────────
+// Price far below/above VWAP + oversold/overbought + Bollinger extreme
+stratF_long  = vwap_below and rsi14 < 48 and bb_pct < 0.25 and buy_prob_final  >= (min_prob - 12) and cooldown_ok
+stratF_short = vwap_above and rsi14 > 52 and bb_pct > 0.75 and sell_prob_final >= (min_prob - 12) and cooldown_ok
+
+// ── Strategy G: Stochastic + Liq Zone Confluence ────────────────────────────
+stratG_long  = stoch_k < 22 and ta.crossover(stoch_k, stoch_d) and buy_liq_intensity  > 20 and buy_prob_final  >= (min_prob - 12) and cooldown_ok
+stratG_short = stoch_k > 78 and ta.crossunder(stoch_k, stoch_d) and sell_liq_intensity > 20 and sell_prob_final >= (min_prob - 12) and cooldown_ok
+
+// ── Aggregate (no conflicting opposite signal on A/B priority) ───────────────
+any_long  = stratA_long  or stratB_long  or stratC_long  or stratD_long  or stratE_long  or stratF_long  or stratG_long
+any_short = stratA_short or stratB_short or stratC_short or stratD_short or stratE_short or stratF_short or stratG_short
+long_signal  = any_long  and not (stratA_short or stratB_short)
+short_signal = any_short and not (stratA_long  or stratB_long)
+
+// ── Minimum signal enforcer ───────────────────────────────────────────────────
+// If N bars have passed since last signal, fire the side with higher probability
+bars_since   = bar_index - last_signal_bar
+force_signal = min_sig_bars > 0 and bars_since >= min_sig_bars and not long_signal and not short_signal
+force_long   = force_signal and buy_prob_final  >= sell_prob_final
+force_short  = force_signal and sell_prob_final >  buy_prob_final
+
+long_signal  := long_signal  or force_long
+short_signal := short_signal or force_short
+
+if long_signal or short_signal
+    last_signal_bar := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 9 - STRATEGY NAME & MANIPULATION LABEL HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+f_strat_long() =>
+    string s = "VWAP Deviation"
+    if stratA_long
+        s := "Liq Sweep Reversal"
+    else if stratB_long
+        s := "Order Block Long"
+    else if stratC_long
+        s := "BOS Continuation"
+    else if stratD_long
+        s := "RSI Div + Liq"
+    else if stratE_long
+        s := "EMA Cross + MACD"
+    else if stratG_long
+        s := "Stoch + Liq Zone"
+    else if force_long
+        s := "Min Signal (Bias)"
+    s
+
+f_strat_short() =>
+    string s = "VWAP Deviation"
+    if stratA_short
+        s := "Liq Sweep Reversal"
+    else if stratB_short
+        s := "Order Block Short"
+    else if stratC_short
+        s := "BOS Continuation"
+    else if stratD_short
+        s := "RSI Div + Liq"
+    else if stratE_short
+        s := "EMA Cross + MACD"
+    else if stratG_short
+        s := "Stoch + Liq Zone"
+    else if force_short
+        s := "Min Signal (Bias)"
+    s
+
+f_manip_long() =>
+    string m = "Clean"
+    if stop_hunt_bull
+        m := "Stop Hunt"
+    else if sweep_low
+        m := "Liq Sweep"
+    else if wyckoff_spring
+        m := "Wyckoff Spring"
+    m
+
+f_manip_short() =>
+    string m = "Clean"
+    if stop_hunt_bear
+        m := "Stop Hunt"
+    else if sweep_high
+        m := "Liq Sweep"
+    else if wyckoff_upthrust
+        m := "Upthrust"
+    m
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 10 - TP / SL LEVELS
+// ══════════════════════════════════════════════════════════════════════════════
+long_sl  = low  - atr14 * 1.4
+long_tp1 = close + atr14 * 1.4
+long_tp2 = close + atr14 * 2.8
+long_tp3 = close + atr14 * 4.5
+
+short_sl  = high + atr14 * 1.4
+short_tp1 = close - atr14 * 1.4
+short_tp2 = close - atr14 * 2.8
+short_tp3 = close - atr14 * 4.5
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 11 - LABEL BUILDER FUNCTIONS (one += per line avoids syntax errors)
+// ══════════════════════════════════════════════════════════════════════════════
+f_lbl_long(string strat, string manip, float entry, float sl, float tp1, float tp2, float tp3, int bprob, int sprob, int rsi_val, float vsurge) =>
+    string t = "LONG  |  " + strat
+    t := t + "\nEntry : $" + str.tostring(entry,  "#.##")
+    t := t + "\nSL    : $" + str.tostring(sl,     "#.##")
+    t := t + "\nTP1   : $" + str.tostring(tp1,    "#.##")
+    t := t + "\nTP2   : $" + str.tostring(tp2,    "#.##")
+    t := t + "\nTP3   : $" + str.tostring(tp3,    "#.##")
+    t := t + "\nBuy Liq : " + str.tostring(bprob) + "%"
+    t := t + "\nSell Liq: " + str.tostring(sprob) + "%"
+    t := t + "\nWin Prob: " + str.tostring(bprob) + "%"
+    t := t + "\nManip   : " + manip
+    t := t + "\nRSI     : " + str.tostring(rsi_val)
+    t := t + "\nVol     : " + str.tostring(vsurge, "#.##") + "x"
+    t
+
+f_lbl_short(string strat, string manip, float entry, float sl, float tp1, float tp2, float tp3, int bprob, int sprob, int rsi_val, float vsurge) =>
+    string t = "SHORT  |  " + strat
+    t := t + "\nEntry : $" + str.tostring(entry,  "#.##")
+    t := t + "\nSL    : $" + str.tostring(sl,     "#.##")
+    t := t + "\nTP1   : $" + str.tostring(tp1,    "#.##")
+    t := t + "\nTP2   : $" + str.tostring(tp2,    "#.##")
+    t := t + "\nTP3   : $" + str.tostring(tp3,    "#.##")
+    t := t + "\nBuy Liq : " + str.tostring(bprob) + "%"
+    t := t + "\nSell Liq: " + str.tostring(sprob) + "%"
+    t := t + "\nWin Prob: " + str.tostring(sprob) + "%"
+    t := t + "\nManip   : " + manip
+    t := t + "\nRSI     : " + str.tostring(rsi_val)
+    t := t + "\nVol     : " + str.tostring(vsurge, "#.##") + "x"
+    t
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 12 - SIGNAL LABELS AND TP/SL LINES
+// ══════════════════════════════════════════════════════════════════════════════
+if long_signal
+    strat_l = f_strat_long()
+    manip_l = f_manip_long()
+    lbl_l   = f_lbl_long(strat_l, manip_l, close, long_sl, long_tp1, long_tp2, long_tp3, buy_prob_final, sell_prob_final, math.round(rsi14), vol_surge)
+
+    label.new(bar_index, low - atr14 * 0.5, lbl_l, color=color.new(#00ff88, 10), textcolor=color.white, style=label.style_label_up, size=size.normal, yloc=yloc.price)
+    line.new(bar_index, long_sl,  bar_index + 25, long_sl,  color=color.new(bear_col, 20), width=2, style=line.style_dashed)
+    line.new(bar_index, long_tp1, bar_index + 25, long_tp1, color=color.new(bull_col, 30), width=1, style=line.style_dotted)
+    line.new(bar_index, long_tp2, bar_index + 25, long_tp2, color=color.new(bull_col, 20), width=1, style=line.style_dotted)
+    label.new(bar_index + 25, long_sl,  "SL",  color=color.new(bear_col, 60), textcolor=bear_col, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 25, long_tp1, "TP1", color=color.new(bull_col, 60), textcolor=bull_col, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 25, long_tp2, "TP2", color=color.new(bull_col, 60), textcolor=bull_col, style=label.style_label_left, size=size.small)
+    if show_tp3
+        line.new(bar_index, long_tp3, bar_index + 25, long_tp3, color=color.new(bull_col, 10), width=1, style=line.style_dotted)
+        label.new(bar_index + 25, long_tp3, "TP3", color=color.new(bull_col, 60), textcolor=bull_col, style=label.style_label_left, size=size.small)
+
+if short_signal
+    strat_s = f_strat_short()
+    manip_s = f_manip_short()
+    lbl_s   = f_lbl_short(strat_s, manip_s, close, short_sl, short_tp1, short_tp2, short_tp3, buy_prob_final, sell_prob_final, math.round(rsi14), vol_surge)
+
+    label.new(bar_index, high + atr14 * 0.5, lbl_s, color=color.new(#ff3d5e, 10), textcolor=color.white, style=label.style_label_down, size=size.normal, yloc=yloc.price)
+    line.new(bar_index, short_sl,  bar_index + 25, short_sl,  color=color.new(bear_col, 20), width=2, style=line.style_dashed)
+    line.new(bar_index, short_tp1, bar_index + 25, short_tp1, color=color.new(bull_col, 30), width=1, style=line.style_dotted)
+    line.new(bar_index, short_tp2, bar_index + 25, short_tp2, color=color.new(bull_col, 20), width=1, style=line.style_dotted)
+    label.new(bar_index + 25, short_sl,  "SL",  color=color.new(bear_col, 60), textcolor=bear_col, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 25, short_tp1, "TP1", color=color.new(bull_col, 60), textcolor=bull_col, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 25, short_tp2, "TP2", color=color.new(bull_col, 60), textcolor=bull_col, style=label.style_label_left, size=size.small)
+    if show_tp3
+        line.new(bar_index, short_tp3, bar_index + 25, short_tp3, color=color.new(bull_col, 10), width=1, style=line.style_dotted)
+        label.new(bar_index + 25, short_tp3, "TP3", color=color.new(bull_col, 60), textcolor=bull_col, style=label.style_label_left, size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 13 - MANIPULATION MARKERS
+// ══════════════════════════════════════════════════════════════════════════════
+plotshape(stop_hunt_bull,   title="Stop Hunt Bull",  location=location.belowbar, style=shape.triangleup,   color=color.new(color.yellow, 20), size=size.tiny,  text="SH")
+plotshape(stop_hunt_bear,   title="Stop Hunt Bear",  location=location.abovebar, style=shape.triangledown, color=color.new(color.yellow, 20), size=size.tiny,  text="SH")
+plotshape(sweep_low,        title="Sweep Low",       location=location.belowbar, style=shape.circle,       color=color.new(#00d4ff, 30),      size=size.tiny,  text="SW")
+plotshape(sweep_high,       title="Sweep High",      location=location.abovebar, style=shape.circle,       color=color.new(#00d4ff, 30),      size=size.tiny,  text="SW")
+plotshape(prev_high_break,  title="Fake Break Up",   location=location.abovebar, style=shape.xcross,       color=color.new(color.orange, 20), size=size.tiny,  text="FK")
+plotshape(prev_low_break,   title="Fake Break Down", location=location.belowbar, style=shape.xcross,       color=color.new(color.orange, 20), size=size.tiny,  text="FK")
+plotshape(wyckoff_spring,   title="Wyckoff Spring",  location=location.belowbar, style=shape.diamond,      color=color.new(color.purple, 20), size=size.small, text="W+")
+plotshape(wyckoff_upthrust, title="Wyckoff Upthrust",location=location.abovebar, style=shape.diamond,      color=color.new(color.purple, 20), size=size.small, text="W-")
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 13 - EMA OVERLAYS
+// ══════════════════════════════════════════════════════════════════════════════
+plot(ema9,    title="EMA 9",  color=color.new(#00d4ff, 30), linewidth=1)
+plot(ema21,   title="EMA 21", color=color.new(#ff9900, 40), linewidth=1)
+plot(ema50,   title="EMA 50", color=color.new(#888888, 50), linewidth=1)
+plot(vwap_val,title="VWAP",   color=color.new(color.white, 60), linewidth=1, style=plot.style_circles)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 14 - SIGNAL PERFORMANCE TRACKER
+// ══════════════════════════════════════════════════════════════════════════════
+var int   total_signals  = 0
+var int   total_longs    = 0
+var int   total_shorts   = 0
+var int   total_tp_hits  = 0
+var int   total_sl_hits  = 0
+var int   today_signals  = 0
+var int   last_day       = 0
+
+var bool  tracking_long  = false
+var bool  tracking_short = false
+var float track_tp1      = na
+var float track_sl_val   = na
+
+// Reset daily counter at new day
+cur_day = dayofmonth
+if cur_day != last_day
+    today_signals := 0
+    last_day      := cur_day
+
+if long_signal
+    total_signals  += 1
+    total_longs    += 1
+    today_signals  += 1
+    tracking_long  := true
+    tracking_short := false
+    track_tp1      := long_tp1
+    track_sl_val   := long_sl
+
+if short_signal
+    total_signals  += 1
+    total_shorts   += 1
+    today_signals  += 1
+    tracking_short := true
+    tracking_long  := false
+    track_tp1      := short_tp1
+    track_sl_val   := short_sl
+
+if tracking_long and not na(track_tp1) and not na(track_sl_val)
+    if high >= track_tp1
+        total_tp_hits  += 1
+        tracking_long  := false
+        track_tp1      := na
+        track_sl_val   := na
+    else if low <= track_sl_val
+        total_sl_hits  += 1
+        tracking_long  := false
+        track_tp1      := na
+        track_sl_val   := na
+
+if tracking_short and not na(track_tp1) and not na(track_sl_val)
+    if low <= track_tp1
+        total_tp_hits  += 1
+        tracking_short := false
+        track_tp1      := na
+        track_sl_val   := na
+    else if high >= track_sl_val
+        total_sl_hits  += 1
+        tracking_short := false
+        track_tp1      := na
+        track_sl_val   := na
+
+closed_signals = total_tp_hits + total_sl_hits
+open_signals   = math.max(total_signals - closed_signals, 0)
+win_rate       = closed_signals > 0 ? math.round(total_tp_hits / closed_signals * 100) : 0
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 15 - STATS TABLE (bottom-right)
+// ══════════════════════════════════════════════════════════════════════════════
+var table stats = table.new(position.bottom_right, 2, 10, bgcolor=color.new(#0c1825, 5), border_color=color.new(#1a3045, 0), border_width=1, frame_color=color.new(#00d4ff, 50), frame_width=1)
+
+if barstate.islast
+    table.cell(stats, 0, 0, "SIGNAL STATS",       bgcolor=color.new(#00d4ff, 75), text_color=color.new(#00d4ff, 0), text_size=size.small, text_halign=text.align_center)
+    table.cell(stats, 1, 0, "COUNT",               bgcolor=color.new(#00d4ff, 75), text_color=color.new(#00d4ff, 0), text_size=size.small, text_halign=text.align_center)
+
+    table.cell(stats, 0, 1, "Total Signals",       text_color=color.silver,                  text_size=size.small, bgcolor=color.new(#050a0f, 10))
+    table.cell(stats, 1, 1, str.tostring(total_signals), text_color=color.new(#00d4ff, 0),   text_size=size.small, bgcolor=color.new(#050a0f, 10))
+
+    // Today's signal count — green if >=2, yellow if 1, red if 0
+    today_col = today_signals >= 2 ? color.new(#00ff88, 0) : today_signals == 1 ? color.yellow : color.new(#ff3d5e, 0)
+    table.cell(stats, 0, 2, "Today's Signals",     text_color=color.silver,    text_size=size.small, bgcolor=color.new(#080f18, 10))
+    table.cell(stats, 1, 2, str.tostring(today_signals) + " / day", text_color=today_col, text_size=size.small, bgcolor=color.new(#080f18, 10))
+
+    table.cell(stats, 0, 3, "Long Signals",        text_color=color.silver,                  text_size=size.small, bgcolor=color.new(#050a0f, 10))
+    table.cell(stats, 1, 3, str.tostring(total_longs),   text_color=color.new(#00ff88, 0),   text_size=size.small, bgcolor=color.new(#050a0f, 10))
+
+    table.cell(stats, 0, 4, "Short Signals",       text_color=color.silver,                  text_size=size.small, bgcolor=color.new(#080f18, 10))
+    table.cell(stats, 1, 4, str.tostring(total_shorts),  text_color=color.new(#ff3d5e, 0),   text_size=size.small, bgcolor=color.new(#080f18, 10))
+
+    table.cell(stats, 0, 5, "Hit Take Profit",     text_color=color.silver,                  text_size=size.small, bgcolor=color.new(#050a0f, 10))
+    table.cell(stats, 1, 5, str.tostring(total_tp_hits), text_color=color.new(#00ff88, 0),   text_size=size.small, bgcolor=color.new(#050a0f, 10))
+
+    table.cell(stats, 0, 6, "Hit Stop Loss",       text_color=color.silver,                  text_size=size.small, bgcolor=color.new(#080f18, 10))
+    table.cell(stats, 1, 6, str.tostring(total_sl_hits), text_color=color.new(#ff3d5e, 0),   text_size=size.small, bgcolor=color.new(#080f18, 10))
+
+    open_col = open_signals > 0 ? color.yellow : color.gray
+    table.cell(stats, 0, 7, "Open / Pending",      text_color=color.silver,                  text_size=size.small, bgcolor=color.new(#050a0f, 10))
+    table.cell(stats, 1, 7, str.tostring(open_signals),  text_color=open_col,                text_size=size.small, bgcolor=color.new(#050a0f, 10))
+
+    table.cell(stats, 0, 8, "",                    text_color=color.gray, text_size=size.tiny, bgcolor=color.new(#080f18, 10))
+    table.cell(stats, 1, 8, "",                    text_color=color.gray, text_size=size.tiny, bgcolor=color.new(#080f18, 10))
+
+    wr_col = win_rate >= 60 ? color.new(#00ff88, 0) : win_rate >= 45 ? color.yellow : color.new(#ff3d5e, 0)
+    table.cell(stats, 0, 9, "Win Rate (TP1)",      text_color=color.silver,                  text_size=size.small, bgcolor=color.new(#050a0f, 10))
+    table.cell(stats, 1, 9, str.tostring(win_rate) + "%", text_color=wr_col,                 text_size=size.small, bgcolor=color.new(#050a0f, 10))
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 16 - MAIN DASHBOARD TABLE (top-right)
+// ══════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 14, bgcolor=color.new(#0c1825, 5), border_color=color.new(#0d1f30, 0), border_width=1, frame_color=color.new(#00d4ff, 60), frame_width=1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "LIQUIDITY ENGINE",     bgcolor=color.new(#00d4ff, 80), text_color=color.new(#00d4ff, 0), text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "STATUS",               bgcolor=color.new(#00d4ff, 80), text_color=color.new(#00d4ff, 0), text_size=size.small, text_halign=text.align_center)
+
+    string trend_str = "NEUTRAL"
+    color  trend_col = color.gray
+    if bull_trend
+        trend_str := "BULLISH"
+        trend_col := color.new(#00ff88, 0)
+    else if bear_trend
+        trend_str := "BEARISH"
+        trend_col := color.new(#ff3d5e, 0)
+    table.cell(dash, 0, 1, "Trend Bias",           text_color=color.silver, text_size=size.small, bgcolor=color.new(#050a0f, 20))
+    table.cell(dash, 1, 1, trend_str,              text_color=trend_col,    text_size=size.small, bgcolor=color.new(#050a0f, 20))
+
+    rsi_col = rsi14 > 70 ? color.new(#ff3d5e, 0) : rsi14 < 30 ? color.new(#00ff88, 0) : color.silver
+    table.cell(dash, 0, 2, "RSI 14",               text_color=color.silver, text_size=size.small, bgcolor=color.new(#080f18, 20))
+    table.cell(dash, 1, 2, str.tostring(math.round(rsi14)), text_color=rsi_col, text_size=size.small, bgcolor=color.new(#080f18, 20))
+
+    vol_col = vol_surge > vol_surge_mult ? color.new(#00ff88, 0) : color.silver
+    table.cell(dash, 0, 3, "Vol Surge",            text_color=color.silver, text_size=size.small, bgcolor=color.new(#050a0f, 20))
+    table.cell(dash, 1, 3, str.tostring(vol_surge, "#.##") + "x", text_color=vol_col, text_size=size.small, bgcolor=color.new(#050a0f, 20))
+
+    table.cell(dash, 0, 4, "Buy-Side Liq",         text_color=color.silver,        text_size=size.small, bgcolor=color.new(#080f18, 20))
+    table.cell(dash, 1, 4, str.tostring(buy_prob_final)  + "%", text_color=color.new(#00ff88, 0), text_size=size.small, bgcolor=color.new(#080f18, 20))
+
+    table.cell(dash, 0, 5, "Sell-Side Liq",        text_color=color.silver,        text_size=size.small, bgcolor=color.new(#050a0f, 20))
+    table.cell(dash, 1, 5, str.tostring(sell_prob_final) + "%", text_color=color.new(#ff3d5e, 0), text_size=size.small, bgcolor=color.new(#050a0f, 20))
+
+    dom_str = buy_prob_final > sell_prob_final ? "BUY DOMINANT" : "SELL DOMINANT"
+    dom_col = buy_prob_final > sell_prob_final ? color.new(#00ff88, 0) : color.new(#ff3d5e, 0)
+    table.cell(dash, 0, 6, "Dominant Side",        text_color=color.silver, text_size=size.small, bgcolor=color.new(#080f18, 20))
+    table.cell(dash, 1, 6, dom_str,                text_color=dom_col,      text_size=size.small, bgcolor=color.new(#080f18, 20))
+
+    best_prob = math.max(buy_prob_final, sell_prob_final)
+    prob_col  = best_prob >= 80 ? color.new(#00ff88, 0) : best_prob >= 60 ? color.yellow : color.gray
+    table.cell(dash, 0, 7, "Win Prob",             text_color=color.silver, text_size=size.small, bgcolor=color.new(#050a0f, 20))
+    table.cell(dash, 1, 7, str.tostring(best_prob) + "%", text_color=prob_col, text_size=size.small, bgcolor=color.new(#050a0f, 20))
+
+    manip_active = stop_hunt_bull or stop_hunt_bear or sweep_low or sweep_high or wyckoff_spring or wyckoff_upthrust
+    string manip_str = "None"
+    if stop_hunt_bull or stop_hunt_bear
+        manip_str := "Stop Hunt"
+    else if sweep_low or sweep_high
+        manip_str := "Sweep"
+    else if wyckoff_spring or wyckoff_upthrust
+        manip_str := "Wyckoff"
+    else if prev_high_break or prev_low_break
+        manip_str := "Fake Break"
+    manip_col = manip_active ? color.yellow : color.green
+    table.cell(dash, 0, 8, "Manipulation",         text_color=color.silver, text_size=size.small, bgcolor=color.new(#080f18, 20))
+    table.cell(dash, 1, 8, manip_str,              text_color=manip_col,    text_size=size.small, bgcolor=color.new(#080f18, 20))
+
+    buy_dist_str = not na(nearest_buy_price) ? str.tostring(math.round(math.abs(nearest_buy_price - close) / close * 100, 2)) + "%" : "N/A"
+    table.cell(dash, 0, 9, "Nearest Buy Liq",      text_color=color.silver,        text_size=size.small, bgcolor=color.new(#050a0f, 20))
+    table.cell(dash, 1, 9, buy_dist_str,           text_color=color.new(#00ff88, 0), text_size=size.small, bgcolor=color.new(#050a0f, 20))
+
+    sell_dist_str = not na(nearest_sell_price) ? str.tostring(math.round(math.abs(nearest_sell_price - close) / close * 100, 2)) + "%" : "N/A"
+    table.cell(dash, 0, 10, "Nearest Sell Liq",    text_color=color.silver,        text_size=size.small, bgcolor=color.new(#080f18, 20))
+    table.cell(dash, 1, 10, sell_dist_str,         text_color=color.new(#ff3d5e, 0), text_size=size.small, bgcolor=color.new(#080f18, 20))
+
+    string ob_str = "None"
+    color  ob_col = color.gray
+    if bull_ob_condition
+        ob_str := "BULL OB"
+        ob_col := color.new(#00d4ff, 0)
+    else if bear_ob_condition
+        ob_str := "BEAR OB"
+        ob_col := color.new(#ff9900, 0)
+    table.cell(dash, 0, 11, "Order Block",         text_color=color.silver, text_size=size.small, bgcolor=color.new(#050a0f, 20))
+    table.cell(dash, 1, 11, ob_str,                text_color=ob_col,       text_size=size.small, bgcolor=color.new(#050a0f, 20))
+
+    // Bars since last signal
+    bsl_col = bars_since >= min_sig_bars and min_sig_bars > 0 ? color.new(#ff3d5e, 0) : bars_since > 6 ? color.yellow : color.silver
+    table.cell(dash, 0, 12, "Bars Since Signal",   text_color=color.silver, text_size=size.small, bgcolor=color.new(#080f18, 20))
+    table.cell(dash, 1, 12, str.tostring(bars_since), text_color=bsl_col,  text_size=size.small, bgcolor=color.new(#080f18, 20))
+
+    table.cell(dash, 0, 13, "Timeframe",           text_color=color.silver,        text_size=size.small, bgcolor=color.new(#050a0f, 20))
+    table.cell(dash, 1, 13, "1H | Min 2/day",      text_color=color.new(#00d4ff, 0), text_size=size.small, bgcolor=color.new(#050a0f, 20))
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SECTION 17 - ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(long_signal,      title="LONG Signal",       message="LONG Signal | {{ticker}} | Price: {{close}} | Check chart for TP/SL")
+alertcondition(short_signal,     title="SHORT Signal",      message="SHORT Signal | {{ticker}} | Price: {{close}} | Check chart for TP/SL")
+alertcondition(stop_hunt_bull,   title="Stop Hunt Bull",    message="Buy-Side Stop Hunt on {{ticker}} at {{close}} - LONG setup forming")
+alertcondition(stop_hunt_bear,   title="Stop Hunt Bear",    message="Sell-Side Stop Hunt on {{ticker}} at {{close}} - SHORT setup forming")
+alertcondition(sweep_low,        title="Sweep Low",         message="Liquidity Sweep LOW on {{ticker}} - Watch for LONG reversal")
+alertcondition(sweep_high,       title="Sweep High",        message="Liquidity Sweep HIGH on {{ticker}} - Watch for SHORT reversal")
+alertcondition(wyckoff_spring,   title="Wyckoff Spring",    message="Wyckoff Spring on {{ticker}} - High prob LONG zone")
+alertcondition(wyckoff_upthrust, title="Wyckoff Upthrust",  message="Wyckoff Upthrust on {{ticker}} - High prob SHORT zone")
+alertcondition(force_long,       title="Force Long (Min Signal)",  message="Minimum signal enforcer fired LONG on {{ticker}}")
+alertcondition(force_short,      title="Force Short (Min Signal)", message="Minimum signal enforcer fired SHORT on {{ticker}}")
