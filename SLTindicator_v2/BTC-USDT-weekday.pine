@@ -1,0 +1,625 @@
+//@version=5
+// ==============================================================
+//  BTC PRO SIGNALS v1.5
+//  Timeframe  : 1H (optimised for BTC/USDT)
+//  Signals    : Long & Short  |  SL / TP1 / TP2 per signal
+//  Logic      : EMA stack + SuperTrend + RSI + MACD +
+//               StochRSI + Volume  (5-of-7 confluence score)
+//  v1.1 change: Signal label (BUY/SELL arrow) turns GREY if
+//               price hits SL before the next signal. Stays
+//               green/red if TP1 or TP2 is hit first.
+//  v1.5 change: Weekend signals blocked (Sat/Sun excluded).
+//               Per-session stats for London & NY sessions
+//               (SL hits + TP1 hits + Win Rate per session).
+//               Session hours are configurable inputs (UTC).
+// ==============================================================
+
+// ==============================================================
+//  Recommended workflow
+//  Set an alert on the script (alertcondition is already built in)
+//  When alert fires → place a limit order at the Entry price shown on the label
+//  Give it a maximum of one full candle (1 hour) to fill
+//  If unfilled after 1H → cancel and wait for next signal
+// ==============================================================
+indicator("BTC Pro Signals v1.5 [SL/TP1/TP2]",
+     shorttitle = "BTC-PS v1.5",
+     overlay    = true,
+     max_labels_count = 500,
+     max_lines_count  = 500)
+
+// ── INPUTS ────────────────────────────────────────────────────
+grpEma   = "EMA Settings"
+emaFast  = input.int(9,   "Fast EMA",   minval=3,  group=grpEma)
+emaMid   = input.int(21,  "Mid EMA",    minval=5,  group=grpEma)
+emaSlow  = input.int(50,  "Slow EMA",   minval=10, group=grpEma)
+emaTrend = input.int(200, "Trend EMA",  minval=50, group=grpEma)
+
+grpRsi  = "RSI Settings"
+rsiLen  = input.int(14, "RSI Length",   minval=2,  group=grpRsi)
+rsiBull = input.int(52, "RSI Bull Min", minval=40, group=grpRsi)
+rsiBear = input.int(48, "RSI Bear Max", minval=20, group=grpRsi)
+
+grpMacd  = "MACD Settings"
+macdFast = input.int(12, "MACD Fast",   minval=2, group=grpMacd)
+macdSlow = input.int(26, "MACD Slow",   minval=5, group=grpMacd)
+macdSig  = input.int(9,  "MACD Signal", minval=2, group=grpMacd)
+
+grpSt    = "SuperTrend Settings"
+stFactor = input.float(2.5, "ST Factor",  step=0.1, group=grpSt)
+stLen    = input.int(10,    "ST ATR Len", minval=1, group=grpSt)
+
+grpVol  = "Volume Settings"
+volMa   = input.int(20,    "Volume MA Length",  minval=5,  group=grpVol)
+volMult = input.float(1.1, "Volume Surge Mult", step=0.05, group=grpVol)
+
+grpAtr  = "ATR Risk Management"
+atrLen  = input.int(14,    "ATR Length",      minval=1, group=grpAtr)
+slMult  = input.float(1.5, "SL  Mult x ATR",  step=0.1, group=grpAtr)
+tp1Mult = input.float(2.0, "TP1 Mult x ATR",  step=0.1, group=grpAtr)
+tp2Mult = input.float(3.5, "TP2 Mult x ATR",  step=0.1, group=grpAtr)
+
+grpStoch = "Stochastic RSI"
+stochK   = input.int(3,  "K Smooth",   minval=1, group=grpStoch)
+stochD   = input.int(3,  "D Smooth",   minval=1, group=grpStoch)
+stochLen = input.int(14, "RSI Len",    minval=1, group=grpStoch)
+stochOB  = input.int(80, "Overbought", minval=60, group=grpStoch)
+stochOS  = input.int(20, "Oversold",   minval=5,  group=grpStoch)
+
+// ── SESSION INPUTS ────────────────────────────────────────────
+grpSession   = "Session Filter (UTC — weekends always excluded)"
+londonSessIn = input.session("0800-1700", "London Session Hours (UTC)", group=grpSession,
+     tooltip="Default 08:00–17:00 UTC. Adjust if your broker uses a different timezone offset.")
+nySessIn     = input.session("1300-2200", "NY Session Hours (UTC)",     group=grpSession,
+     tooltip="Default 13:00–22:00 UTC. Overlaps with London 13:00–17:00 UTC.")
+
+grpDisp    = "Display"
+showEmas   = input.bool(true, "Show EMAs",          group=grpDisp)
+showST     = input.bool(true, "Show SuperTrend",    group=grpDisp)
+showLabels = input.bool(true, "Show Signal Labels", group=grpDisp)
+showSLTP   = input.bool(true, "Show SL/TP Lines",   group=grpDisp)
+showDash   = input.bool(true, "Show Dashboard",     group=grpDisp)
+
+minBarsBetween = input.int(5, "Min Bars Between Signals", minval=1, group=grpDisp,
+     tooltip="Prevents the same signal firing on consecutive bars. 5 = min 5 bars gap.")
+
+// ── CALCULATIONS ──────────────────────────────────────────────
+
+e9   = ta.ema(close, emaFast)
+e21  = ta.ema(close, emaMid)
+e50  = ta.ema(close, emaSlow)
+e200 = ta.ema(close, emaTrend)
+
+rsi = ta.rsi(close, rsiLen)
+
+[macdLine, signalLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+histBull = ta.crossover(macdLine, signalLine)  or (hist > 0 and hist > hist[1])
+histBear = ta.crossunder(macdLine, signalLine) or (hist < 0 and hist < hist[1])
+
+[stVal, stDir] = ta.supertrend(stFactor, stLen)
+stBull = stDir < 0
+stBear = stDir > 0
+
+volAvg   = ta.sma(volume, volMa)
+volSurge = volume > volAvg * volMult
+
+atr = ta.atr(atrLen)
+
+stochRsi      = ta.rsi(rsi, stochLen)
+kLine         = ta.sma(stochRsi, stochK)
+stochBullZone = kLine < stochOB
+stochBearZone = kLine > stochOS
+
+emaBull   = e9 > e21 and e21 > e50
+emaBear   = e9 < e21 and e21 < e50
+priceBull = close > e21 and close > e9
+priceBear = close < e21 and close < e9
+
+// ── WEEKEND FILTER ────────────────────────────────────────────
+// dayofweek: 1=Sunday, 2=Monday … 6=Friday, 7=Saturday  (Pine Script convention)
+isWeekend = dayofweek == dayofweek.saturday or dayofweek == dayofweek.sunday
+
+// ── SESSION DETECTION (UTC) ───────────────────────────────────
+// Returns true on bars that fall inside the defined session window.
+// time() returns na when the bar is outside the session.
+inLondon = not na(time(timeframe.period, londonSessIn, "UTC")) and not isWeekend
+inNY     = not na(time(timeframe.period, nySessIn,     "UTC")) and not isWeekend
+
+// Session ID used when a signal fires:
+//   0 = Outside tracked sessions (or weekend)
+//   1 = London only
+//   2 = NY only
+//   3 = London–NY overlap
+barSessionId = inLondon and inNY ? 3 : inLondon ? 1 : inNY ? 2 : 0
+
+// ── CONFLUENCE SCORE ──────────────────────────────────────────
+
+longScore  = (emaBull  ? 1 : 0)
+           + (rsi > rsiBull and rsi < 75 ? 1 : 0)
+           + (histBull ? 1 : 0)
+           + (stBull   ? 1 : 0)
+           + (volSurge ? 1 : 0)
+           + (stochBullZone ? 1 : 0)
+           + (priceBull ? 1 : 0)
+
+shortScore = (emaBear  ? 1 : 0)
+           + (rsi < rsiBear and rsi > 25 ? 1 : 0)
+           + (histBear ? 1 : 0)
+           + (stBear   ? 1 : 0)
+           + (volSurge ? 1 : 0)
+           + (stochBearZone ? 1 : 0)
+           + (priceBear ? 1 : 0)
+
+// ── SIGNAL GATING WITH COOLDOWN (weekends blocked) ────────────
+
+var int lastLongBar  = -999
+var int lastShortBar = -999
+
+longEdge  = longScore  >= 5 and longScore[1]  < 5
+shortEdge = shortScore >= 5 and shortScore[1] < 5
+
+// isWeekend added here: no signals on Sat/Sun
+longFinal  = longEdge  and (bar_index - lastLongBar  >= minBarsBetween) and not shortEdge and not isWeekend
+shortFinal = shortEdge and (bar_index - lastShortBar >= minBarsBetween) and not longEdge  and not isWeekend
+
+if longFinal
+    lastLongBar := bar_index
+if shortFinal
+    lastShortBar := bar_index
+
+// ── RISK LEVELS ───────────────────────────────────────────────
+
+longSL  = close - atr * slMult
+longTP1 = close + atr * tp1Mult
+longTP2 = close + atr * tp2Mult
+
+shortSL  = close + atr * slMult
+shortTP1 = close - atr * tp1Mult
+shortTP2 = close - atr * tp2Mult
+
+// ── PLOT EMAs ─────────────────────────────────────────────────
+
+plot(showEmas ? e9   : na, "EMA 9",   color=color.new(#00e5ff, 0), linewidth=1)
+plot(showEmas ? e21  : na, "EMA 21",  color=color.new(#ffeb3b, 0), linewidth=1)
+plot(showEmas ? e50  : na, "EMA 50",  color=color.new(#ff9800, 0), linewidth=2)
+plot(showEmas ? e200 : na, "EMA 200", color=color.new(#e040fb, 0), linewidth=2)
+
+// ── PLOT SUPERTREND ───────────────────────────────────────────
+
+stColor = stBull ? color.new(#00e676, 0) : color.new(#f44336, 0)
+plot(showST ? stVal : na, "SuperTrend", color=stColor, linewidth=2)
+
+// ── SIGNAL ARROW LABELS (recolourable) ───────────────────────
+// Arrays hold every unresolved signal so that when a new signal
+// fires on the same bar that a prior one resolves, no label is
+// orphaned. Each slot stores: label handle, SL, TP1, TP2,
+// direction (1=long / -1=short), and a TP1-lock flag (int 0/1).
+
+var label[] sigLabels  = array.new<label>()
+var float[] sigSLs     = array.new<float>()
+var float[] sigTP1s    = array.new<float>()
+var float[] sigTP2s    = array.new<float>()
+var int[]   sigDirs    = array.new<int>()
+var int[]   sigLocked  = array.new<int>()   // 1 = TP1 touched, colour locked
+
+colorLong  = color.new(#00e676, 0)
+colorShort = color.new(#f44336, 0)
+colorSL    = color.new(#888888, 0)
+
+// ── Step 1: add new signal label to the tracking arrays ───────
+if longFinal
+    _lbl = label.new(
+         x         = bar_index,
+         y         = low,
+         text      = "BUY\n"
+              + "Entry : " + str.tostring(math.round(close,   2)) + "\n"
+              + "SL    : " + str.tostring(math.round(longSL,  2)) + "\n"
+              + "TP1   : " + str.tostring(math.round(longTP1, 2)) + "\n"
+              + "TP2   : " + str.tostring(math.round(longTP2, 2)),
+         yloc      = yloc.belowbar,
+         color     = colorLong,
+         textcolor = color.white,
+         style     = label.style_label_up,
+         size      = size.normal)
+    array.push(sigLabels, _lbl)
+    array.push(sigSLs,    longSL)
+    array.push(sigTP1s,   longTP1)
+    array.push(sigTP2s,   longTP2)
+    array.push(sigDirs,   1)
+    array.push(sigLocked, 0)
+
+if shortFinal
+    _lbl = label.new(
+         x         = bar_index,
+         y         = high,
+         text      = "SELL\n"
+              + "Entry : " + str.tostring(math.round(close,    2)) + "\n"
+              + "SL    : " + str.tostring(math.round(shortSL,  2)) + "\n"
+              + "TP1   : " + str.tostring(math.round(shortTP1, 2)) + "\n"
+              + "TP2   : " + str.tostring(math.round(shortTP2, 2)),
+         yloc      = yloc.abovebar,
+         color     = colorShort,
+         textcolor = color.white,
+         style     = label.style_label_down,
+         size      = size.normal)
+    array.push(sigLabels, _lbl)
+    array.push(sigSLs,    shortSL)
+    array.push(sigTP1s,   shortTP1)
+    array.push(sigTP2s,   shortTP2)
+    array.push(sigDirs,   -1)
+    array.push(sigLocked, 0)
+
+// ── Step 2: iterate ALL unresolved labels every bar ───────────
+if array.size(sigLabels) > 0
+    for _i = array.size(sigLabels) - 1 to 0
+        _lbl    = array.get(sigLabels, _i)
+        _sl     = array.get(sigSLs,    _i)
+        _tp1    = array.get(sigTP1s,   _i)
+        _tp2    = array.get(sigTP2s,   _i)
+        _dir    = array.get(sigDirs,   _i)
+        _locked = array.get(sigLocked, _i)
+
+        if bar_index == label.get_x(_lbl)
+            continue
+
+        _resolved = false
+
+        if _locked == 0
+            if _dir == 1
+                if low <= _sl
+                    label.set_color(_lbl,     colorSL)
+                    label.set_textcolor(_lbl, color.new(#cccccc, 0))
+                    _resolved := true
+                else if high >= _tp2
+                    _resolved := true
+                else if high >= _tp1
+                    array.set(sigLocked, _i, 1)
+            else if _dir == -1
+                if high >= _sl
+                    label.set_color(_lbl,     colorSL)
+                    label.set_textcolor(_lbl, color.new(#cccccc, 0))
+                    _resolved := true
+                else if low <= _tp2
+                    _resolved := true
+                else if low <= _tp1
+                    array.set(sigLocked, _i, 1)
+        else
+            if _dir == 1
+                if low <= _sl or high >= _tp2
+                    _resolved := true
+            else if _dir == -1
+                if high >= _sl or low <= _tp2
+                    _resolved := true
+
+        if _resolved
+            array.remove(sigLabels, _i)
+            array.remove(sigSLs,    _i)
+            array.remove(sigTP1s,   _i)
+            array.remove(sigTP2s,   _i)
+            array.remove(sigDirs,   _i)
+            array.remove(sigLocked, _i)
+
+// ── SL/TP HORIZONTAL LINES (last signal) ─────────────────────
+
+var line lnLongSL   = na
+var line lnLongTP1  = na
+var line lnLongTP2  = na
+var line lnShortSL  = na
+var line lnShortTP1 = na
+var line lnShortTP2 = na
+
+if longFinal and showSLTP
+    line.delete(lnLongSL)
+    line.delete(lnLongTP1)
+    line.delete(lnLongTP2)
+    lnLongSL  := line.new(bar_index, longSL,  bar_index + 20, longSL,
+         color=color.new(#f44336, 0), width=1, style=line.style_dashed)
+    lnLongTP1 := line.new(bar_index, longTP1, bar_index + 20, longTP1,
+         color=color.new(#66bb6a, 0), width=1, style=line.style_dashed)
+    lnLongTP2 := line.new(bar_index, longTP2, bar_index + 20, longTP2,
+         color=color.new(#26a69a, 0), width=2, style=line.style_dashed)
+
+if shortFinal and showSLTP
+    line.delete(lnShortSL)
+    line.delete(lnShortTP1)
+    line.delete(lnShortTP2)
+    lnShortSL  := line.new(bar_index, shortSL,  bar_index + 20, shortSL,
+         color=color.new(#f44336, 0), width=1, style=line.style_dashed)
+    lnShortTP1 := line.new(bar_index, shortTP1, bar_index + 20, shortTP1,
+         color=color.new(#66bb6a, 0), width=1, style=line.style_dashed)
+    lnShortTP2 := line.new(bar_index, shortTP2, bar_index + 20, shortTP2,
+         color=color.new(#26a69a, 0), width=2, style=line.style_dashed)
+
+// ── BACKGROUND ────────────────────────────────────────────────
+
+bgColor = emaBull and stBull ? color.new(#00e676, 95) :
+          emaBear and stBear ? color.new(#f44336, 95) :
+          color.new(#888888, 98)
+bgcolor(bgColor, title="Trend Background")
+
+// ── CONFLUENCE SCORE PANE ─────────────────────────────────────
+
+plot(longScore,  "Long Score",  color=color.new(#00e676, 0), display=display.pane)
+plot(shortScore, "Short Score", color=color.new(#f44336, 0), display=display.pane)
+hline(5, "Signal Threshold", color=color.yellow, linestyle=hline.style_dotted)
+
+// ── DASHBOARD TABLE ───────────────────────────────────────────
+
+var table dash = table.new(position.top_right, 2, 10,
+     bgcolor      = color.new(#1a1a2e, 5),
+     border_color = color.new(#444444, 0),
+     border_width = 1,
+     frame_color  = color.new(#7c4dff, 0),
+     frame_width  = 2)
+
+dashRow(int row, string lbl, string val, color lblClr, color valClr) =>
+    table.cell(dash, 0, row, lbl,
+         bgcolor     = color.new(#12122a, 5),
+         text_color  = lblClr,
+         text_size   = size.small,
+         text_halign = text.align_left)
+    table.cell(dash, 1, row, val,
+         bgcolor     = color.new(#12122a, 5),
+         text_color  = valClr,
+         text_size   = size.small,
+         text_halign = text.align_right)
+
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "BTC PRO SIGNALS v1.5",
+         bgcolor     = color.new(#7c4dff, 0),
+         text_color  = color.white,
+         text_size   = size.small,
+         text_halign = text.align_center)
+    table.merge_cells(dash, 0, 0, 1, 0)
+
+    trend    = emaBull and stBull ? "BULLISH" : emaBear and stBear ? "BEARISH" : "NEUTRAL"
+    trendClr = emaBull and stBull ? color.new(#00e676, 0) :
+               emaBear and stBear ? color.new(#f44336, 0) : color.gray
+    rsiStr   = str.tostring(math.round(rsi, 1))
+    rsiClr   = rsi > 70 ? color.new(#f44336, 0) :
+               rsi < 30 ? color.new(#00e676, 0) : color.white
+    macdStr  = hist > 0 ? "BULL" : "BEAR"
+    macdClr  = hist > 0 ? color.new(#00e676, 0) : color.new(#f44336, 0)
+    stStr    = stBull ? "BULL" : "BEAR"
+    stClr    = stBull ? color.new(#00e676, 0) : color.new(#f44336, 0)
+    volStr   = volSurge ? "SURGE" : "NORMAL"
+    volClr   = volSurge ? color.new(#ffeb3b, 0) : color.gray
+    lScr     = str.tostring(longScore)  + "/7"
+    sScr     = str.tostring(shortScore) + "/7"
+    atrStr   = str.tostring(math.round(atr, 0))
+    slStr    = str.tostring(math.round(atr * slMult, 0))
+
+    dashRow(1, "Trend",      trend,   color.silver, trendClr)
+    dashRow(2, "RSI(" + str.tostring(rsiLen) + ")", rsiStr, color.silver, rsiClr)
+    dashRow(3, "MACD Hist",  macdStr, color.silver, macdClr)
+    dashRow(4, "SuperTrend", stStr,   color.silver, stClr)
+    dashRow(5, "Volume",     volStr,  color.silver, volClr)
+    dashRow(6, "Long Score", lScr,    color.silver, color.new(#00e676, 0))
+    dashRow(7, "Shrt Score", sScr,    color.silver, color.new(#f44336, 0))
+    dashRow(8, "ATR",        atrStr,  color.silver, color.white)
+    dashRow(9, "SL Dist",    slStr + " pts", color.silver, color.new(#ff8a80, 0))
+
+// ── SIGNAL OUTCOME TRACKER ────────────────────────────────────
+// Tracks SL / TP1 / TP2 hits for the OVERALL stats table AND
+// splits counts into London / NY / Overlap buckets for the
+// session stats table.  Weekend signals can never reach here
+// because longFinal / shortFinal already block them.
+
+var int   tradeDir     = 0
+var float tradeSL      = na
+var float tradeTP1     = na
+var float tradeTP2     = na
+var bool  tp1Hit       = false
+var bool  justOpened   = false
+var int   tradeSession = 0    // session ID captured at signal open
+
+var int cntTotal = 0
+var int cntSL    = 0
+var int cntTP1   = 0
+var int cntTP2   = 0
+
+// Per-session counters
+// London-only  (session == 1)  +  overlap  (session == 3)  → London bucket
+// NY-only      (session == 2)  +  overlap  (session == 3)  → NY bucket
+var int cntLondonSL  = 0
+var int cntLondonTP1 = 0
+var int cntNYSL      = 0
+var int cntNYTP1     = 0
+
+// Helper booleans used inside the resolution block
+inLondonBucket(int sess) => sess == 1 or sess == 3
+inNYBucket(int sess)     => sess == 2 or sess == 3
+
+if longFinal or shortFinal
+    tradeDir     := longFinal ? 1 : -1
+    tradeSL      := longFinal ? longSL    : shortSL
+    tradeTP1     := longFinal ? longTP1   : shortTP1
+    tradeTP2     := longFinal ? longTP2   : shortTP2
+    tp1Hit       := false
+    justOpened   := true
+    tradeSession := barSessionId      // capture session at signal open
+    cntTotal     := cntTotal + 1
+else
+    justOpened := false
+
+if not justOpened and tradeDir != 0 and not na(tradeSL)
+
+    if tradeDir == 1
+        if low <= tradeSL
+            if not tp1Hit
+                cntSL := cntSL + 1
+                if inLondonBucket(tradeSession)
+                    cntLondonSL := cntLondonSL + 1
+                if inNYBucket(tradeSession)
+                    cntNYSL := cntNYSL + 1
+            tradeDir := 0
+
+        else if high >= tradeTP2
+            if not tp1Hit
+                cntTP1 := cntTP1 + 1
+                if inLondonBucket(tradeSession)
+                    cntLondonTP1 := cntLondonTP1 + 1
+                if inNYBucket(tradeSession)
+                    cntNYTP1 := cntNYTP1 + 1
+            cntTP2   := cntTP2 + 1
+            tradeDir := 0
+
+        else if high >= tradeTP1 and not tp1Hit
+            cntTP1 := cntTP1 + 1
+            if inLondonBucket(tradeSession)
+                cntLondonTP1 := cntLondonTP1 + 1
+            if inNYBucket(tradeSession)
+                cntNYTP1 := cntNYTP1 + 1
+            tp1Hit := true
+
+    else if tradeDir == -1
+        if high >= tradeSL
+            if not tp1Hit
+                cntSL := cntSL + 1
+                if inLondonBucket(tradeSession)
+                    cntLondonSL := cntLondonSL + 1
+                if inNYBucket(tradeSession)
+                    cntNYSL := cntNYSL + 1
+            tradeDir := 0
+
+        else if low <= tradeTP2
+            if not tp1Hit
+                cntTP1 := cntTP1 + 1
+                if inLondonBucket(tradeSession)
+                    cntLondonTP1 := cntLondonTP1 + 1
+                if inNYBucket(tradeSession)
+                    cntNYTP1 := cntNYTP1 + 1
+            cntTP2   := cntTP2 + 1
+            tradeDir := 0
+
+        else if low <= tradeTP1 and not tp1Hit
+            cntTP1 := cntTP1 + 1
+            if inLondonBucket(tradeSession)
+                cntLondonTP1 := cntLondonTP1 + 1
+            if inNYBucket(tradeSession)
+                cntNYTP1 := cntNYTP1 + 1
+            tp1Hit := true
+
+cntResolved = cntTP1 + cntSL
+winRatio    = cntResolved > 0 ? (float(cntTP1) / float(cntResolved)) * 100.0 : 0.0
+
+// ── OVERALL STATS TABLE (bottom-right) ────────────────────────
+
+var table stats = table.new(position.bottom_right, 2, 7,
+     bgcolor      = color.new(#0d1b2a, 5),
+     border_color = color.new(#444444, 0),
+     border_width = 1,
+     frame_color  = color.new(#00b4d8, 0),
+     frame_width  = 2)
+
+statsRow(int row, string lbl, string val, color valClr) =>
+    table.cell(stats, 0, row, lbl,
+         bgcolor     = color.new(#0d1b2a, 5),
+         text_color  = color.silver,
+         text_size   = size.small,
+         text_halign = text.align_left)
+    table.cell(stats, 1, row, val,
+         bgcolor     = color.new(#0d1b2a, 5),
+         text_color  = valClr,
+         text_size   = size.small,
+         text_halign = text.align_right)
+
+if showDash and barstate.islast
+    table.cell(stats, 0, 0, "SIGNAL STATS",
+         bgcolor     = color.new(#00b4d8, 0),
+         text_color  = color.white,
+         text_size   = size.small,
+         text_halign = text.align_center)
+    table.merge_cells(stats, 0, 0, 1, 0)
+
+    wrColor = winRatio >= 60.0 ? color.new(#00e676, 0) :
+              winRatio >= 45.0 ? color.new(#ffeb3b, 0) :
+              color.new(#f44336, 0)
+
+    openStr = tradeDir == 1 ? "LONG" : tradeDir == -1 ? "SHORT" : "NONE"
+    openClr = tradeDir == 1 ? color.new(#00e676, 0) :
+              tradeDir == -1 ? color.new(#f44336, 0) : color.gray
+
+    statsRow(1, "Total Signals", str.tostring(cntTotal),                    color.white)
+    statsRow(2, "SL Hit",        str.tostring(cntSL),                       color.new(#ff8a80, 0))
+    statsRow(3, "TP1 Hit",       str.tostring(cntTP1),                      color.new(#b9f6ca, 0))
+    statsRow(4, "TP2 Hit",       str.tostring(cntTP2),                      color.new(#69f0ae, 0))
+    statsRow(5, "Open Trade",    openStr,                                    openClr)
+    statsRow(6, "Win Rate(TP1)", str.tostring(math.round(winRatio, 1)) + "%", wrColor)
+
+// ── SESSION STATS TABLE (bottom-left) ─────────────────────────
+// Rows: header | London SL | London TP1 | London WR |
+//               NY SL      | NY TP1     | NY WR      |
+//               note (overlap)
+// Overlap signals (13:00–17:00 UTC) are counted in BOTH buckets.
+
+var table sessStats = table.new(position.bottom_left, 2, 9,
+     bgcolor      = color.new(#0d1b2a, 5),
+     border_color = color.new(#444444, 0),
+     border_width = 1,
+     frame_color  = color.new(#ffa726, 0),
+     frame_width  = 2)
+
+sessRow(int row, string lbl, string val, color valClr) =>
+    table.cell(sessStats, 0, row, lbl,
+         bgcolor     = color.new(#0d1b2a, 5),
+         text_color  = color.silver,
+         text_size   = size.small,
+         text_halign = text.align_left)
+    table.cell(sessStats, 1, row, val,
+         bgcolor     = color.new(#0d1b2a, 5),
+         text_color  = valClr,
+         text_size   = size.small,
+         text_halign = text.align_right)
+
+if showDash and barstate.islast
+    // ── header ──
+    table.cell(sessStats, 0, 0, "SESSION STATS  (No Weekends)",
+         bgcolor     = color.new(#ffa726, 0),
+         text_color  = color.white,
+         text_size   = size.small,
+         text_halign = text.align_center)
+    table.merge_cells(sessStats, 0, 0, 1, 0)
+
+    // ── London section label ──
+    table.cell(sessStats, 0, 1, "── LONDON (08-17 UTC) ──",
+         bgcolor     = color.new(#1a2e1a, 0),
+         text_color  = color.new(#69f0ae, 0),
+         text_size   = size.small,
+         text_halign = text.align_center)
+    table.merge_cells(sessStats, 0, 1, 1, 1)
+
+    londonResolved = cntLondonTP1 + cntLondonSL
+    londonWR       = londonResolved > 0
+         ? (float(cntLondonTP1) / float(londonResolved)) * 100.0 : 0.0
+    londonWRColor  = londonWR >= 60.0 ? color.new(#00e676, 0) :
+                     londonWR >= 45.0 ? color.new(#ffeb3b, 0) :
+                     color.new(#f44336, 0)
+
+    sessRow(2, "  SL Hit",  str.tostring(cntLondonSL),                         color.new(#ff8a80, 0))
+    sessRow(3, "  TP1 Hit", str.tostring(cntLondonTP1),                        color.new(#b9f6ca, 0))
+    sessRow(4, "  Win Rate", str.tostring(math.round(londonWR, 1)) + "%",       londonWRColor)
+
+    // ── NY section label ──
+    table.cell(sessStats, 0, 5, "── NEW YORK (13-22 UTC) ──",
+         bgcolor     = color.new(#1a1a2e, 0),
+         text_color  = color.new(#82b1ff, 0),
+         text_size   = size.small,
+         text_halign = text.align_center)
+    table.merge_cells(sessStats, 0, 5, 1, 5)
+
+    nyResolved = cntNYTP1 + cntNYSL
+    nyWR       = nyResolved > 0
+         ? (float(cntNYTP1) / float(nyResolved)) * 100.0 : 0.0
+    nyWRColor  = nyWR >= 60.0 ? color.new(#00e676, 0) :
+                 nyWR >= 45.0 ? color.new(#ffeb3b, 0) :
+                 color.new(#f44336, 0)
+
+    sessRow(6, "  SL Hit",  str.tostring(cntNYSL),                             color.new(#ff8a80, 0))
+    sessRow(7, "  TP1 Hit", str.tostring(cntNYTP1),                            color.new(#b9f6ca, 0))
+    sessRow(8, "  Win Rate", str.tostring(math.round(nyWR, 1)) + "%",           nyWRColor)
+
+// ── ALERTS ────────────────────────────────────────────────────
+
+alertcondition(longFinal,  "BTC LONG Signal",  "BTC LONG fired - check SL/TP levels")
+alertcondition(shortFinal, "BTC SHORT Signal", "BTC SHORT fired - check SL/TP levels")
+alertcondition(longFinal or shortFinal, "BTC Any Signal", "BTC Signal fired - check chart")
