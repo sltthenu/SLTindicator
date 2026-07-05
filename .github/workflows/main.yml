@@ -4,8 +4,8 @@ on:
       test_suit:
         description: Test suit
         type: choice
+        value: functional
         options:
-          - functional
           - regression
 
 jobs:
