@@ -2,7 +2,7 @@ on:
   workflow_dispatch:
     inputs:
       test_suit:
-      description: Test test_suit
+      description: Test suit
       type: choice
       options:
         - functional
