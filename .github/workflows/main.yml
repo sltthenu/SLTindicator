@@ -1,0 +1,10 @@
+name: test flow
+
+on: workflow_dispatch
+  input: 
+    test suit:
+      description: manula trigger
+      required: true
+      value: functional
+      options:
+        -  regression
